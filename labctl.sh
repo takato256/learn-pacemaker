@@ -74,7 +74,7 @@ lock_lab() {
 
 preflight() {
   [[ -x $PROXY ]] || fail "$PROXY が必要です"
-  [[ $(podman info --format '{{.Host.NetworkBackend}} {{.Host.CgroupVersion}}') == 'netavark v2' ]] ||
+  [[ $(podman info --format '{{.Host.NetworkBackend}} {{.Host.CgroupsVersion}}') == 'netavark v2' ]] ||
     fail 'Netavark と cgroup v2 が必要です'
   podman image exists "$IMAGE" || fail 'イメージを podman load で取り込むか、build を実行してください'
 }

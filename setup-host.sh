@@ -7,4 +7,4 @@ if ! command -v podman >/dev/null; then
   dnf -y --setopt=install_weak_deps=False install podman netavark
 fi
 [[ -x /usr/lib/systemd/systemd-socket-proxyd ]] || { echo 'systemd-socket-proxyd が必要です' >&2; exit 1; }
-podman info --format 'network={{.Host.NetworkBackend}} cgroup={{.Host.CgroupVersion}}'
+podman info --format 'network={{.Host.NetworkBackend}} cgroup={{.Host.CgroupsVersion}}'

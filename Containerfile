@@ -13,7 +13,7 @@ RUN useradd -m -s /bin/bash lab && \
     chmod 0440 /etc/sudoers.d/90-lab && visudo -cf /etc/sudoers.d/90-lab && \
     systemctl disable httpd pcsd corosync pacemaker sshd && \
     rm -f /etc/ssh/ssh_host_*key* && \
-    truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id && \
+    mkdir -p /var/lib/dbus && truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id && \
     ln -s /etc/machine-id /var/lib/dbus/machine-id
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
