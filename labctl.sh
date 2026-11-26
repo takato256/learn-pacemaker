@@ -1,151 +1,388 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-CALLER_PWD=$PWD
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 IMAGE=localhost/pacemaker-lab:rocky9
 LABEL=io.pacemaker.sandbox
-fail(){ echo "ERROR: $*" >&2; exit 1; }
-usage(){ cat <<'USAGE'
-使い方 (rootful Podman): sudo ./labctl.sh COMMAND [ARGS]
-  build                     イメージ作成
-  create [人数=2]            lab01〜指定人数を新規作成 (1〜10)
-  add LAB                   指定labを新規作成 (3〜10への拡張など)
-  status [lab番号=1]         クラスタ状態
-  shell LAB ROLE             node01/node02/client の管理者用シェル
-  check LAB                  VIP/HTTP/クラスタ状態の検査
-  test LAB                   node01→node02→node01 の自動系切替試験
-  isolation LAB_A LAB_B      クライアントから別labへの疎通遮断を検査
-  key LAB PUBLIC_KEY         参加者の公開鍵を3台に設定・SSHを起動
-  proxy LAB [BIND_IP=127.0.0.1]  SSH用TCPプロキシを起動 (socat必要)
-  unproxy LAB                SSH用TCPプロキシ停止
-  reset LAB                  指定labを削除して初期状態で再作成 (鍵も消去)
-  destroy LAB                指定labを削除
-  list                      このキットのコンテナ一覧
+PROXY=/usr/lib/systemd/systemd-socket-proxyd
+
+fail() { echo "エラー: $*" >&2; exit 1; }
+usage() {
+  cat <<'USAGE'
+使い方: sudo bash labctl.sh コマンド
+  build                   接続可能な環境でイメージを作成
+  create [人数=1] [待受IP=127.0.0.1]  参加者1〜10の環境とSSHを起動
+  add 番号 [待受IP=127.0.0.1]        指定番号の環境だけを追加
+  list                    ノード、待受IP、SSHポートを表示
+  status [番号=1]          クラスタ状態を表示
+  shell 番号 node01|node02  管理者用シェル
+  check 番号               2ノード、クォーラム、VIP、HTTPを確認
+  test 番号                standbyによる往復切り替えを実行
+  isolation 番号 別番号    別環境へのSSH・HTTP接続が失敗することを確認
+  access 番号              ホスト再起動後などにSSH待受を再開
+  reset 番号               指定環境を削除して初期化
+  destroy 番号             指定環境を削除
 USAGE
 }
-[[ $# -gt 0 ]] || { usage; exit 0; }
-[[ $1 != -h && $1 != --help ]] || { usage; exit 0; }
-[[ $EUID == 0 ]] || fail 'sudo で実行してください'
-command -v podman >/dev/null || fail 'setup-host.sh を先に実行してください'
-# 01等も許可するが数値範囲を限定
-labnum(){ [[ $1 =~ ^[0-9]{1,2}$ ]] || fail 'LAB は1〜10'; local n=$((10#$1)); (( n>=1 && n<=10 )) || fail 'LAB は1〜10'; printf '%d' "$n"; }
-select_lab(){ N=$(labnum "$1"); printf -v LAB 'lab%02d' "$N"; BASE="10.200.$N"; NET="${LAB}-net"; A="${LAB}-node01"; B="${LAB}-node02"; C="${LAB}-client"; VIP="$BASE.100"; }
-owned(){ [[ $(podman inspect --format "{{index .Config.Labels \"$LABEL\"}}" "$1") == "$LAB" ]] || fail "$1 はこのlabの管理対象ではありません"; }
-net_owned(){ [[ $(podman network inspect --format "{{index .Labels \"$LABEL\"}}" "$NET") == "$LAB" ]] || fail "$NET はこのlabの管理対象ではありません"; }
-ex(){ local node=$1; shift; podman exec "$node" "$@"; }
-wait_unit(){ local node=$1 unit=$2; for ((i=0;i<45;i++)); do if ex "$node" systemctl is-active --quiet "$unit"; then return 0; fi; sleep 2; done; ex "$node" journalctl -u "$unit" -n 30 --no-pager || true; fail "$node の $unit が起動しません"; }
-wait_systemd(){ local node=$1 state; for ((i=0;i<45;i++)); do state=$(ex "$node" systemctl is-system-running 2>/dev/null || true); case $state in running|degraded) return 0;; esac; sleep 2; done; podman logs --tail 30 "$node" || true; fail "$node のsystemdが起動しません"; }
-wait_http(){ local expected=$1 result; for ((i=0;i<45;i++)); do result=$(ex "$C" curl --noproxy '*' -fsS --max-time 2 "http://$VIP/" 2>/dev/null || true); if [[ $result == "$expected" ]]; then echo "HTTP OK: $VIP -> $result"; return 0; fi; sleep 2; done; ex "$A" pcs status --full || true; fail "VIP $VIP が $expected で応答しません (last=$result)"; }
-both_members(){
+
+lab_number() {
+  [[ $1 =~ ^[0-9]{1,2}$ ]] || fail '番号・人数は1〜10を指定してください'
+  local number=$((10#$1))
+  (( number >= 1 && number <= 10 )) || fail '番号・人数は1〜10を指定してください'
+  printf '%s\n' "$number"
+}
+
+select_lab() {
+  N=$(lab_number "$1")
+  printf -v LAB 'lab%02d' "$N"
+  NET="$LAB-net"
+  A="$LAB-node01"
+  B="$LAB-node02"
+  BASE=10.200.0
+  local offset=$(((N - 1) * 8))
+  SUBNET="$BASE.$offset/29"
+  GATEWAY="$BASE.$((offset + 1))"
+  IP_A="$BASE.$((offset + 2))"
+  IP_B="$BASE.$((offset + 3))"
+  VIP="$BASE.$((offset + 4))"
+  PORT_A=$((22000 + N * 10 + 1))
+  PORT_B=$((PORT_A + 1))
+}
+
+run_in() {
+  local node=$1
+  shift
+  podman exec "$node" "$@"
+}
+
+node_label() {
+  podman container inspect --format "{{index .Config.Labels \"$2\"}}" "$1"
+}
+
+owned() {
+  [[ $(node_label "$1" "$LABEL") == "$LAB" ]] || fail "$1 は $LAB の管理対象ではありません"
+}
+
+network_owned() {
+  [[ $(podman network inspect --format "{{index .Labels \"$LABEL\"}}" "$NET") == "$LAB" ]] ||
+    fail "$NET は $LAB の管理対象ではありません"
+}
+
+lock_lab() {
+  exec 9>"/run/lock/pacemaker-$LAB.lock"
+  flock -n 9 || fail "$LAB は別の管理操作を実行中です"
+}
+
+preflight() {
+  [[ -x $PROXY ]] || fail "$PROXY が必要です"
+  [[ $(podman info --format '{{.Host.NetworkBackend}} {{.Host.CgroupVersion}}') == 'netavark v2' ]] ||
+    fail 'Netavark と cgroup v2 が必要です'
+  podman image exists "$IMAGE" || fail 'イメージを podman load で取り込むか、build を実行してください'
+}
+
+validate_bind() {
+  local bind=$1 octet
+  local -a octets
+  [[ $bind =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ && $bind != 0.0.0.0 ]] ||
+    fail '待受にはホストのIPv4アドレスを指定してください'
+  IFS=. read -r -a octets <<< "$bind"
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) && [[ $octet == "$((10#$octet))" ]] ||
+      fail '待受IPv4アドレスを確認してください'
+  done
+}
+
+wait_systemd() {
+  local node=$1 state i
+  for ((i=0; i<45; i++)); do
+    state=$(run_in "$node" systemctl is-system-running 2>/dev/null || true)
+    case $state in running|degraded) return 0;; esac
+    sleep 2
+  done
+  podman logs --tail 30 "$node" >&2 || true
+  fail "$node の systemd が起動しません"
+}
+
+members_ready() {
   local members
-  members=$(ex "$A" crm_node -l 2>/dev/null) || return 1
-  awk -v a="$A" -v b="$B" '$2==a && $3=="member" {x=1} $2==b && $3=="member" {y=1} END{exit !(x&&y)}' <<< "$members"
+  members=$(run_in "$A" crm_node -l 2>/dev/null) || return 1
+  awk -v a="$A" -v b="$B" '
+    $2==a && $3=="member" {first=1}
+    $2==b && $3=="member" {second=1}
+    END {exit !(first && second)}
+  ' <<< "$members"
 }
-wait_members(){
-  for ((i=0;i<45;i++)); do if both_members; then return 0; fi; sleep 2; done
-  ex "$A" pcs status --full || true; fail 'Pacemakerに2ノードが参加していません'
+
+wait_members() {
+  local i
+  for ((i=0; i<45; i++)); do
+    if members_ready; then return 0; fi
+    sleep 2
+  done
+  run_in "$A" pcs status --full >&2 || true
+  fail '2ノードがクラスタに参加していません'
 }
-preflight(){
-  [[ $(podman info --format '{{.Host.NetworkBackend}}') == netavark ]] || fail 'Netavark backend が必要です'
-  [[ $(podman info --format '{{.Host.CgroupVersion}}') == v2 ]] || fail 'cgroup v2 が必要です'
-  podman image exists "$IMAGE" || fail 'build を先に実行してください'
+
+http_probe() {
+  run_in "$1" curl --noproxy '*' -fsS --max-time 2 "http://$VIP/"
 }
-create_lab(){
-  local node role ip pass
-  for node in "$A" "$B" "$C"; do if podman container exists "$node"; then fail "$node が存在します。reset または destroy を使用してください"; fi; done
-  if podman network exists "$NET"; then fail "$NET が存在します。destroy で整理してください"; fi
-  echo "=== $LAB ($BASE.0/24) ==="
-  podman network create --driver bridge --internal --opt isolate=true --subnet "$BASE.0/24" --gateway "$BASE.1" --label "$LABEL=$LAB" "$NET"
-  for role in node01 node02 client; do
-    local -a opts=()
-    case $role in
-      node01) node=$A; ip=11;; node02) node=$B; ip=12;; client) node=$C; ip=20;;
-    esac
-    if [[ $role == client ]]; then opts=(--memory 512m --cpus 0.5 --pids-limit 256); else
-      opts=(--memory 1024m --cpus 1 --pids-limit 512 --cap-add NET_ADMIN --cap-add SYS_NICE --cap-add SYS_RESOURCE --cap-add IPC_LOCK --shm-size 128m --ulimit memlock=-1:-1)
+
+wait_http() {
+  local expected=$1 peer=$A result i
+  [[ $expected != "$A" ]] || peer=$B
+  for ((i=0; i<45; i++)); do
+    result=$(http_probe "$peer" 2>/dev/null || true)
+    if [[ $result == "$expected" ]]; then
+      printf 'HTTP OK %s → %s\n' "$VIP" "$result"
+      return 0
     fi
-    podman run -d --name "$node" --hostname "$node" --label "$LABEL=$LAB" \
-      --network "$NET" --ip "$BASE.$ip" --systemd=always --stop-timeout 30 \
-      --add-host "$A:$BASE.11" --add-host "$B:$BASE.12" --add-host "$C:$BASE.20" \
-      "${opts[@]}" "$IMAGE"
-    wait_systemd "$node"
+    sleep 2
   done
-  # クラスタごとに異なる管理パスワード。画面に表示しない。
-  pass=$(ex "$A" openssl rand -hex 24)
-  for node in "$A" "$B"; do
-    printf 'hacluster:%s\n' "$pass" | podman exec -i "$node" chpasswd
-    ex "$node" bash -c 'printf "%s\n" "$(hostname)" > /var/www/html/index.html; printf "%s\n" "lab ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/90-lab; chmod 0440 /etc/sudoers.d/90-lab; visudo -cf /etc/sudoers.d/90-lab'
-    ex "$node" systemctl enable --now pcsd
-    wait_unit "$node" pcsd
-  done
-  ex "$A" pcs host auth "$A" "$B" -u hacluster -p "$pass"
-  unset pass
-  ex "$A" pcs cluster setup "${LAB}-cluster" "$A" "addr=$BASE.11" "$B" "addr=$BASE.12"
-  ex "$A" pcs cluster start --all
-  ex "$A" pcs cluster enable --all
-  for node in "$A" "$B"; do wait_unit "$node" corosync; wait_unit "$node" pacemaker; done
-  wait_members
-  ex "$A" pcs property set stonith-enabled=false
-  ex "$A" pcs resource defaults update resource-stickiness=100
-  ex "$A" pcs node standby "$B"
-  ex "$A" pcs resource create vip ocf:heartbeat:IPaddr2 ip="$VIP" cidr_netmask=24 op monitor interval=5s --group web-group
-  ex "$A" pcs resource create web systemd:httpd op monitor interval=10s --group web-group
-  wait_http "$A"
-  ex "$A" pcs node unstandby "$B"
-  ex "$A" pcs status --full
-  echo "Created $LAB. 管理者: ./labctl.sh shell $N node01"
+  run_in "$A" pcs status --full >&2 || true
+  fail "$peer から VIP $VIP を確認できませんでした (期待値: $expected)"
 }
-stop_proxies(){ local role; for role in node01 node02 client; do systemctl stop "pm-${LAB}-${role}-ssh.service" 2>/dev/null || true; done; }
-destroy_lab(){
+
+start_proxy() {
+  local bind=$2 port=$3 ip=$4 unit="pm-$1-ssh"
+  if systemctl is-active --quiet "$unit.socket"; then return 0; fi
+  systemd-run --quiet --unit="$unit" --property=User=nobody \
+    --property=NoNewPrivileges=yes --socket-property="ListenStream=$bind:$port" \
+    "$PROXY" "$ip:22"
+}
+
+show_access() {
+  local bind=$1
+  printf '%s (VIP %s)\n  node01: ssh -p %s lab@%s\n  node02: ssh -p %s lab@%s\n' \
+    "$LAB" "$VIP" "$PORT_A" "$bind" "$PORT_B" "$bind"
+}
+
+start_access() {
+  local bind=$1
+  start_proxy "$A" "$bind" "$PORT_A" "$IP_A"
+  start_proxy "$B" "$bind" "$PORT_B" "$IP_B"
+  show_access "$bind"
+}
+
+destroy_lab() {
   local node
-  # 所有確認を先に全件行う。衝突する既存資産は触らない。
-  for node in "$A" "$B" "$C"; do if podman container exists "$node"; then owned "$node"; fi; done
-  if podman network exists "$NET"; then net_owned; fi
-  stop_proxies
-  for node in "$A" "$B" "$C"; do if podman container exists "$node"; then podman rm -f -t 30 "$node"; fi; done
+  # 先に所有権を確認してから削除する。
+  for node in "$A" "$B" "$LAB-client"; do
+    if podman container exists "$node"; then owned "$node"; fi
+  done
+  if podman network exists "$NET"; then network_owned; fi
+  for node in "$A" "$B"; do
+    if systemctl is-active --quiet "pm-$node-ssh.socket" "pm-$node-ssh.service"; then
+      systemctl stop "pm-$node-ssh.socket" "pm-$node-ssh.service"
+    fi
+  done
+  # 旧構成を初期化する場合のクライアントとSSH中継も片付ける。
+  for node in "$A" "$B" "$LAB-client"; do
+    if systemctl is-active --quiet "pm-$node-ssh.service"; then
+      systemctl stop "pm-$node-ssh.service"
+    fi
+    if podman container exists "$node"; then podman rm -f -t 30 "$node"; fi
+  done
   if podman network exists "$NET"; then podman network rm "$NET"; fi
 }
-check_lab(){
-  local result count=0 node has_vip
-  for node in "$A" "$B" "$C"; do owned "$node"; done
-  ex "$A" pcs status --full
-  both_members || fail 'Pacemakerに2ノードが参加していません'
-  local quorum
-  quorum=$(ex "$A" corosync-quorumtool -s); printf '%s\n' "$quorum"
-  grep -Eq '^Quorate:[[:space:]]+Yes' <<< "$quorum" || fail 'Quorumなし'
-  result=$(ex "$C" curl --noproxy '*' -fsS --max-time 5 "http://$VIP/")
-  [[ $result == "$A" || $result == "$B" ]] || fail "想定外のHTTP応答: $result"
-  for node in "$A" "$B"; do
-    ex "$node" systemctl is-active --quiet pacemaker
-    has_vip=$(ex "$node" ip -4 -o addr show | awk -v vip="$VIP/24" '$4==vip {print $4}')
-    if [[ -n $has_vip ]]; then ((count+=1)); [[ $node == "$result" ]] || fail 'VIPとHTTPの応答ノードが不一致'; fi
+
+wait_pcsd() {
+  local i
+  for ((i=0; i<30; i++)); do
+    if run_in "$A" timeout 2 bash -c ': > "/dev/tcp/$1/2224" && : > "/dev/tcp/$2/2224"' _ "$IP_A" "$IP_B" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
   done
-  [[ $count == 1 ]] || fail "VIP保有ノード数=$count"
-  echo "PASS: $LAB VIP=$VIP active=$result (VIP重複なし)"
+  fail '両ノードの pcsd に接続できません'
 }
-case "$1" in
-  build) [[ $# == 1 ]] || fail 'build は引数なし'; podman build -t "$IMAGE" -f Containerfile .;;
-  create) [[ $# -le 2 ]] || fail 'create [人数]'; count=$(labnum "${2:-2}"); preflight; for ((j=1;j<=count;j++)); do select_lab "$j"; create_lab; done;;
-  add) [[ $# == 2 ]] || fail 'add LAB'; select_lab "$2"; preflight; create_lab;;
-  list) podman ps -a --filter "label=$LABEL" --format 'table {{.Names}}\t{{.Status}}\t{{.Networks}}';;
-  status) select_lab "${2:-1}"; owned "$A"; ex "$A" pcs status --full;;
-  shell) [[ $# == 3 ]] || fail 'shell LAB ROLE'; select_lab "$2"; case $3 in node01|node02|client) ;; *) fail 'ROLEが不正';; esac; owned "$LAB-$3"; podman exec -it "$LAB-$3" /bin/bash;;
-  check) [[ $# == 2 ]] || fail 'check LAB'; select_lab "$2"; check_lab;;
-  test) [[ $# == 2 ]] || fail 'test LAB'; select_lab "$2"; check_lab; [[ $(ex "$C" curl --noproxy '*' -fsS --max-time 5 "http://$VIP/") == "$A" ]] || fail '初期Activeがnode01ではありません。手順書で切り戻してください';
-    ex "$A" pcs node standby "$A"; wait_http "$B"; check_lab
-    ex "$B" pcs node unstandby "$A"; ex "$B" pcs node standby "$B"; wait_http "$A"; ex "$A" pcs node unstandby "$B"; check_lab; echo "PASS: $LAB 往復切替完了";;
-  isolation) [[ $# == 3 ]] || fail 'isolation LAB_A LAB_B'; select_lab "$2"; owned "$C"; source_c=$C; source_n=$N; select_lab "$3"; [[ $N != "$source_n" ]] || fail '異なるLABを指定'; owned "$A"; owned "$C"; check_lab; ex "$source_c" ip route; [[ -z $(ex "$source_c" ip -4 route show default) ]] || fail 'clientにdefault routeあり';
-    for target in "$BASE.11:2224" "$BASE.12:2224" "$VIP:80"; do host=${target%:*}; port=${target##*:}; if ex "$source_c" timeout 4 bash -c 'echo >/dev/tcp/$1/$2' _ "$host" "$port" 2>/dev/null; then fail "別labへ接続可能: $target"; fi; done; echo "PASS: $source_c -> $LAB の検査対象TCPポートは接続不可";;
-  key) [[ $# == 3 ]] || fail 'key LAB PUBLIC_KEY'; key_input=$3; [[ $key_input == /* ]] || key_input="$CALLER_PWD/$key_input"; keyfile=$(realpath -e -- "$key_input" 2>/dev/null || true); [[ -n $keyfile && -f $keyfile ]] || fail '公開鍵が見つかりません'; [[ $(awk 'NF{n++} END{print n+0}' "$keyfile") == 1 ]] || fail '公開鍵は1行のみ'; grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)) [A-Za-z0-9+/=]+( |$)' "$keyfile" || fail '通常のOpenSSH公開鍵を指定'; ssh-keygen -lf "$keyfile" >/dev/null; select_lab "$2";
-    for node in "$A" "$B" "$C"; do owned "$node"; podman exec -i "$node" bash -c 'install -d -m 700 -o lab -g lab /home/lab/.ssh; cat > /home/lab/.ssh/authorized_keys; chown lab:lab /home/lab/.ssh/authorized_keys; chmod 600 /home/lab/.ssh/authorized_keys; ssh-keygen -A; /usr/sbin/sshd -t; systemctl enable --now sshd' < "$keyfile"; wait_unit "$node" sshd; done;;
-  proxy) [[ $# -ge 2 && $# -le 3 ]] || fail 'proxy LAB [BIND_IP]'; select_lab "$2"; bind=${3:-127.0.0.1}; [[ $bind =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && $bind != 0.0.0.0 ]] || fail '明示的なVMのIPv4を指定 (0.0.0.0禁止)'; command -v socat >/dev/null || fail 'sudo dnf install -y socat';
-    for node in "$A" "$B" "$C"; do owned "$node"; ex "$node" systemctl is-active --quiet sshd || fail 'key を先に実行'; done
-    for role in node01 node02 client; do case $role in node01) off=1; dest=11;; node02) off=2; dest=12;; client) off=3; dest=20;; esac; port=$((22000+N*10+off)); unit="pm-${LAB}-${role}-ssh";
-      systemd-run --unit "$unit" --property=User=nobody --property=NoNewPrivileges=yes --property=ProtectSystem=strict --property=ProtectHome=yes --property=TasksMax=64 --property=MemoryMax=128M /usr/bin/socat "TCP4-LISTEN:$port,bind=$bind,reuseaddr,fork" "TCP4:$BASE.$dest:22";
-      sleep 0.3; systemctl is-active --quiet "$unit" || fail "$unit の起動失敗"; echo "ssh -p $port lab@$bind ($role)"; done;;
-  unproxy) [[ $# == 2 ]] || fail 'unproxy LAB'; select_lab "$2"; stop_proxies;;
-  reset) [[ $# == 2 ]] || fail 'reset LAB'; select_lab "$2"; preflight; destroy_lab; create_lab;;
-  destroy) [[ $# == 2 ]] || fail 'destroy LAB'; select_lab "$2"; destroy_lab;;
+
+create_lab() (
+  local bind=$1 node ip pass cluster_pass
+  for node in "$A" "$B" "$LAB-client"; do
+    if podman container exists "$node"; then fail "$node は既に存在します。list で確認してください"; fi
+  done
+  if podman network exists "$NET"; then fail "$NET は既に存在します"; fi
+
+  podman network create --driver bridge --internal --opt isolate=true \
+    --subnet "$SUBNET" --gateway "$GATEWAY" --label "$LABEL=$LAB" "$NET"
+  # 途中で失敗した場合は、この作成操作の資源だけを片付ける。
+  trap 'rc=$?; if (( rc != 0 )); then destroy_lab; fi' EXIT
+
+  read -r pass < /proc/sys/kernel/random/uuid
+  pass="lab-${pass%%-*}"
+  read -r cluster_pass < /proc/sys/kernel/random/uuid
+  for node in "$A" "$B"; do
+    ip=$IP_A
+    [[ $node != "$B" ]] || ip=$IP_B
+    podman run -d --pull=never --name "$node" --hostname "$node" \
+      --label "$LABEL=$LAB" --label "$LABEL.bind=$bind" \
+      --network "$NET" --ip "$ip" --systemd=always --stop-timeout 30 \
+      --add-host "$A:$IP_A" --add-host "$B:$IP_B" \
+      --memory 1024m --cpus 1 --pids-limit 512 --shm-size 128m --ulimit memlock=-1:-1 \
+      --cap-add NET_ADMIN --cap-add SYS_NICE --cap-add SYS_RESOURCE --cap-add IPC_LOCK "$IMAGE"
+    wait_systemd "$node"
+    printf 'lab:%s\nhacluster:%s\n' "$pass" "$cluster_pass" | podman exec -i "$node" chpasswd
+    run_in "$node" bash -c 'printf "%s\n" "$HOSTNAME" > /var/www/html/index.html'
+    run_in "$node" ssh-keygen -A
+    run_in "$node" /usr/sbin/sshd -t
+    run_in "$node" systemctl enable --now sshd pcsd
+  done
+
+  wait_pcsd
+  run_in "$A" pcs host auth "$A" "$B" -u hacluster -p "$cluster_pass"
+  run_in "$A" pcs cluster setup "$LAB-cluster" "$A" "addr=$IP_A" "$B" "addr=$IP_B"
+  run_in "$A" pcs cluster start --all
+  run_in "$A" pcs cluster enable --all
+  wait_members
+  run_in "$A" pcs property set stonith-enabled=false
+  run_in "$A" pcs resource defaults update resource-stickiness=100
+  run_in "$A" pcs node standby "$B"
+  run_in "$A" pcs resource create vip ocf:heartbeat:IPaddr2 ip="$VIP" cidr_netmask=29 op monitor interval=5s --group web-group
+  run_in "$A" pcs resource create web systemd:httpd op monitor interval=10s --group web-group
+  wait_http "$A"
+  run_in "$A" pcs node unstandby "$B"
+  start_access "$bind"
+  printf 'SSHユーザー lab / パスワード %s\n' "$pass"
+)
+
+check_lab() {
+  local node quorum first second active count=0
+  owned "$A"
+  owned "$B"
+  run_in "$A" pcs status --full
+  members_ready || fail '2ノードがクラスタに参加していません'
+  quorum=$(run_in "$A" corosync-quorumtool -s)
+  grep -Eq '^Quorate:[[:space:]]+Yes' <<< "$quorum" || fail 'クォーラムを確認できません'
+  first=$(http_probe "$A")
+  second=$(http_probe "$B")
+  [[ $first == "$second" && ( $first == "$A" || $first == "$B" ) ]] ||
+    fail '両ノードから同じHTTP応答を確認できません'
+  active=$first
+  for node in "$A" "$B"; do
+    if run_in "$node" ip -4 -o addr show | awk -v vip="$VIP/29" '$4==vip {found=1} END {exit !found}'; then
+      ((count+=1))
+      [[ $node == "$active" ]] || fail 'VIPとHTTP応答のノードが一致しません'
+    fi
+  done
+  [[ $count == 1 ]] || fail "VIPを持つノード数が1ではありません ($count)"
+  echo "PASS $LAB: $VIP → $active"
+}
+
+test_lab() {
+  check_lab
+  [[ $(http_probe "$B") == "$A" ]] || fail 'node01を稼働系にしてから test を実行してください'
+  run_in "$A" pcs node standby "$A"
+  wait_http "$B"
+  run_in "$B" pcs node unstandby "$A"
+  run_in "$B" pcs node standby "$B"
+  wait_http "$A"
+  run_in "$A" pcs node unstandby "$B"
+  check_lab
+}
+
+isolation_test() {
+  select_lab "$1"
+  local source=$A source_number=$N target routes rc
+  owned "$source"
+  routes=$(run_in "$source" ip -4 route show default)
+  [[ -z $routes ]] || fail "$source にデフォルトルートがあります"
+  select_lab "$2"
+  [[ $N != "$source_number" ]] || fail '異なる番号を指定してください'
+  check_lab
+  for target in "$IP_A:22" "$IP_B:22" "$VIP:80"; do
+    if run_in "$source" timeout 3 bash -c ': > "/dev/tcp/$1/$2"' _ "${target%:*}" "${target##*:}" 2>/dev/null; then
+      fail "$source から別環境の $target に接続できました"
+    else
+      rc=$?
+      [[ $rc == 1 || $rc == 124 ]] || fail "$source で疎通検査を実行できません ($rc)"
+    fi
+  done
+  echo "PASS $source → $LAB の SSH・HTTP 接続遮断"
+}
+
+case ${1:-} in ''|-h|--help) usage; exit 0;; esac
+[[ $EUID == 0 ]] || fail 'sudo bash labctl.sh で実行してください'
+command -v podman >/dev/null || fail '先に sudo bash setup-host.sh を実行してください'
+command=$1
+shift
+
+case $command in
+  build)
+    [[ $# == 0 ]] || fail 'build に引数は不要です'
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
+    podman build --pull=missing -t "$IMAGE" -f Containerfile .
+    ;;
+  create|add)
+    [[ $# -le 2 ]] || fail "$command 番号または人数 [待受IP]"
+    [[ $command != add || $# -ge 1 ]] || fail 'add 番号 [待受IP]'
+    bind=${2:-127.0.0.1}
+    validate_bind "$bind"
+    preflight
+    last=$(lab_number "${1:-1}")
+    first=1
+    [[ $command != add ]] || first=$last
+    for ((j=first; j<=last; j++)); do
+      select_lab "$j"
+      lock_lab
+      create_lab "$bind"
+      exec 9>&-
+    done
+    ;;
+  list)
+    [[ $# == 0 ]] || fail 'list に引数は不要です'
+    podman ps -a --filter "label=$LABEL" --format 'table {{.Names}}\t{{.Status}}'
+    for ((j=1; j<=10; j++)); do
+      select_lab "$j"
+      if podman container exists "$A"; then
+        bind=$(node_label "$A" "$LABEL.bind")
+        if [[ -n $bind && $(node_label "$A" "$LABEL") == "$LAB" ]]; then show_access "$bind"; fi
+      fi
+    done
+    ;;
+  status)
+    [[ $# -le 1 ]] || fail 'status [番号]'
+    select_lab "${1:-1}"
+    owned "$A"
+    run_in "$A" pcs status --full
+    ;;
+  shell)
+    [[ $# == 2 && ( $2 == node01 || $2 == node02 ) ]] || fail 'shell 番号 node01|node02'
+    select_lab "$1"
+    owned "$LAB-$2"
+    podman exec -it "$LAB-$2" /bin/bash
+    ;;
+  isolation)
+    [[ $# == 2 ]] || fail 'isolation 番号 別番号'
+    isolation_test "$1" "$2"
+    ;;
+  check|test|access|reset|destroy)
+    [[ $# == 1 ]] || fail "$command 番号"
+    select_lab "$1"
+    case $command in
+      check) check_lab;;
+      test) lock_lab; test_lab;;
+      access)
+        lock_lab
+        owned "$A"
+        owned "$B"
+        bind=$(node_label "$A" "$LABEL.bind")
+        validate_bind "$bind"
+        start_access "$bind"
+        ;;
+      reset)
+        lock_lab
+        preflight
+        bind=127.0.0.1
+        if podman container exists "$A"; then
+          owned "$A"
+          saved_bind=$(node_label "$A" "$LABEL.bind")
+          bind=${saved_bind:-$bind}
+        fi
+        validate_bind "$bind"
+        destroy_lab
+        create_lab "$bind"
+        ;;
+      destroy) lock_lab; destroy_lab;;
+    esac
+    ;;
   *) usage; exit 1;;
 esac
